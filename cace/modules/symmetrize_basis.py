@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from opt_einsum import contract
 from .angular_tools import (
     find_combo_vectors_nu2,
     find_combo_vectors_nu3,
     find_combo_vectors_nu4
     )
 
-__all__ = ['Symmetrizer', 'Symmetrizer_JIT', 'Symmetrizer_Tensor']
+__all__ = ['Symmetrizer', 'Symmetrizer_JIT', 'Symmetrizer_Tensor', 'Symmetrizer_Tensor_Optimized']
 
 """
 This class is used to symmetrize the basis functions in the A basis.
@@ -220,6 +221,22 @@ class Symmetrizer_Tensor(nn.Module):
                     indices = [self.l_list_indices[tuple(lxlylz)] for lxlylz in item[:-1]]
                     self.sym_tensor_allnu[4][indices[0], indices[1], indices[2], indices[3], i] = prefactor
 
+    def _apply(self, fn):
+        """Override _apply to move tensors in sym_tensor_allnu dictionary to device."""
+        # Call parent _apply first to handle registered buffers/parameters
+        super()._apply(fn)
+        
+        # Move tensors in sym_tensor_allnu dictionary
+        for key in self.sym_tensor_allnu:
+            if isinstance(self.sym_tensor_allnu[key], torch.Tensor):
+                self.sym_tensor_allnu[key] = fn(self.sym_tensor_allnu[key])
+
+        for key in self.vec_dict_allnu:
+            if isinstance(self.vec_dict_allnu[key], torch.Tensor):
+                self.vec_dict_allnu[key] = fn(self.vec_dict_allnu[key])
+        
+        return self
+
     def forward(self, node_attr: torch.Tensor):
         num_nodes, n_radial, n_l, n_chanel = node_attr.size()
         assert n_l == self.n_l
@@ -256,6 +273,55 @@ class Symmetrizer_Tensor(nn.Module):
             n_sym_node_attr_now = sym_tensor.shape[4]
 
             sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = torch.einsum('ijlmnok,lmnoa->ijak', node_attr_4, sym_tensor)
+            n_sym_node_attr += n_sym_node_attr_now
+
+        return sym_node_attr
+
+
+class Symmetrizer_Tensor_Optimized(Symmetrizer_Tensor):
+    """ This symmetrizer is implemented using optimized tensor operations with opt_einsum.
+        Uses fused einsum operations to avoid storing large intermediate tensors.
+    """
+    def forward(self, node_attr: torch.Tensor):
+        num_nodes, n_radial, n_l, n_chanel = node_attr.size()
+        assert n_l == self.n_l
+
+        n_angular_sym = 1 + np.sum([len(self.vec_dict_allnu[nu]) for nu in range(2, self.max_nu + 1)])
+        sym_node_attr = torch.zeros((num_nodes, n_radial, n_angular_sym, n_chanel),
+                                    dtype=node_attr.dtype, device=node_attr.device)
+
+        # Directly assign for nu == 1
+        sym_node_attr[:, :, 0, :] = node_attr[:, :, 0, :]
+        n_sym_node_attr = 1
+
+        if self.max_nu >= 2:
+            # Fuse the two einsum operations to avoid storing node_attr_2
+            sym_tensor = self.sym_tensor_allnu[2]
+            n_sym_node_attr_now = sym_tensor.shape[2]
+
+            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = contract(
+                'ijlk,ijmk,lma->ijak', node_attr, node_attr, sym_tensor, optimize='optimal', backend='torch'
+            )
+            n_sym_node_attr += n_sym_node_attr_now
+
+        if self.max_nu >= 3:
+            # Fuse all three einsum operations to avoid storing node_attr_2 and node_attr_3
+            sym_tensor = self.sym_tensor_allnu[3]
+            n_sym_node_attr_now = sym_tensor.shape[3]
+
+            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = contract(
+                'ijlk,ijmk,ijnk,lmna->ijak', node_attr, node_attr, node_attr, sym_tensor, optimize='optimal', backend='torch'
+            )
+            n_sym_node_attr += n_sym_node_attr_now
+
+        if self.max_nu >= 4:
+            # Fuse all four einsum operations to avoid storing node_attr_2, node_attr_3, and node_attr_4
+            sym_tensor = self.sym_tensor_allnu[4]
+            n_sym_node_attr_now = sym_tensor.shape[4]
+
+            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = contract(
+                'ijlk,ijmk,ijnk,ijok,lmnoa->ijak', node_attr, node_attr, node_attr, node_attr, sym_tensor, optimize='optimal', backend='torch'
+            )
             n_sym_node_attr += n_sym_node_attr_now
 
         return sym_node_attr
