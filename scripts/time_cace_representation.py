@@ -24,6 +24,8 @@ N_ATOM_BASIS = 32
 N_RBF = 8
 NUM_MESSAGE_PASSING = 0
 
+# torch._dynamo.config.capture_scalar_outputs = True
+
 
 def create_test_structure():
     """Create a simple water molecule for testing."""
@@ -154,7 +156,7 @@ def main():
     print(f"Standard deviation: {std_time*1000:.4f} ms")
     print(f"Minimum walltime: {min_time*1000:.4f} ms")
     print(f"Maximum walltime: {max_time*1000:.4f} ms")
-    print(f"Average walltime: {avg_time:.6f} seconds")
+    # print(f"Average walltime: {avg_time:.6f} seconds")
     print("="*60)
     
     # Print output shape for verification

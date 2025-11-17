@@ -12,6 +12,7 @@ from ..modules import (
     AngularComponent_GPU,
     SharedRadialLinearTransform,
     Symmetrizer,
+    Symmetrizer_Vectorized,
     Symmetrizer_Tensor,
     Symmetrizer_Tensor_Optimized,
     #Symmetrizer_JIT,
@@ -124,7 +125,8 @@ class Cace(nn.Module):
 
         self.l_list = self.angular_basis.get_lxlylz_list()
         # self.symmetrizer = Symmetrizer(self.max_nu, self.max_l, self.l_list)
-        self.symmetrizer = Symmetrizer_Tensor_Optimized(self.max_nu, self.max_l, self.l_list)
+        # self.symmetrizer = Symmetrizer_Tensor_Optimized(self.max_nu, self.max_l, self.l_list)
+        self.symmetrizer = Symmetrizer_Vectorized(self.max_nu, self.max_l, self.l_list)
         # the JIT version seems to be slower
         #symmetrizer = Symmetrizer_JIT(self.max_nu, self.max_l, self.l_list)
         #self.symmetrizer = torch.jit.script(symmetrizer)

@@ -1,14 +1,15 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from opt_einsum import contract
+from opt_einsum import contract, shared_intermediates
 from .angular_tools import (
     find_combo_vectors_nu2,
     find_combo_vectors_nu3,
     find_combo_vectors_nu4
     )
 
-__all__ = ['Symmetrizer', 'Symmetrizer_JIT', 'Symmetrizer_Tensor', 'Symmetrizer_Tensor_Optimized']
+__all__ = ['Symmetrizer', 'Symmetrizer_Vectorized', 'Symmetrizer_JIT',
+           'Symmetrizer_Tensor', 'Symmetrizer_Tensor_Optimized']
 
 """
 This class is used to symmetrize the basis functions in the A basis.
@@ -165,6 +166,102 @@ class Symmetrizer(nn.Module):
 
         return sym_node_attr
 
+class Symmetrizer_Vectorized(nn.Module):
+    """Vectorized Symmetrizer that batches combinations per order using tensor ops."""
+    def __init__(self, max_nu: int, max_l: int, l_list: list):
+        super().__init__()
+        if max_nu >= 5:
+            raise NotImplementedError
+
+        self.max_nu = max_nu
+        self.max_l = max_l
+
+        l_list_tuples = [tuple(l) for l in l_list]
+        self.l_list_indices = {l_tuple: i for i, l_tuple in enumerate(l_list_tuples)}
+
+        if max_nu > 4:
+            raise NotImplementedError("max_nu > 4 is not supported yet.")
+
+        self.vec_dict_allnu = {}
+        if max_nu >= 2:
+            self.vec_dict_allnu[2] = find_combo_vectors_nu2(self.max_l)[0]
+        if max_nu >= 3:
+            self.vec_dict_allnu[3] = find_combo_vectors_nu3(self.max_l)[0]
+        if max_nu == 4:
+            self.vec_dict_allnu[4] = find_combo_vectors_nu4(self.max_l)[0]
+
+        # Keep this as a Python int so TorchDynamo doesn't wrap it into a fake scalar.
+        total_slots = sum(len(self.vec_dict_allnu[nu]) for nu in range(2, self.max_nu + 1))
+        self.n_angular_sym = 1 + int(total_slots)
+        self.order_offsets = {}
+        self.n_slots_per_order = {}
+        self._build_blocks()
+
+    def _build_blocks(self):
+        """Precompute tensors for vectorized contractions per nu."""
+        offset = 1
+        for nu in range(2, self.max_nu + 1):
+            vec_dict = self.vec_dict_allnu.get(nu)
+            if vec_dict is None:
+                continue
+
+            combo_indices = []
+            combo_prefactors = []
+            combo_slots = []
+
+            for slot_idx, (_, combo_list) in enumerate(vec_dict.items()):
+                for item in combo_list:
+                    prefactor = item[-1]
+                    indices = [self.l_list_indices[tuple(lxlylz)] for lxlylz in item[:-1]]
+                    combo_indices.append(indices)
+                    combo_prefactors.append(prefactor)
+                    combo_slots.append(slot_idx)
+
+            if not combo_indices:
+                continue
+
+            indices_tensor = torch.tensor(combo_indices, dtype=torch.long)
+            prefactors_tensor = torch.tensor(combo_prefactors, dtype=torch.get_default_dtype())
+            slots_tensor = torch.tensor(combo_slots, dtype=torch.long)
+
+            self.register_buffer(f"indices_nu{nu}", indices_tensor)
+            self.register_buffer(f"prefactors_nu{nu}", prefactors_tensor)
+            self.register_buffer(f"slots_nu{nu}", slots_tensor)
+            self.order_offsets[nu] = offset
+            self.n_slots_per_order[nu] = len(vec_dict)
+            offset += len(vec_dict)
+
+    def forward(self, node_attr: torch.Tensor):
+        num_nodes, n_radial, _, n_channel = node_attr.size()
+
+        sym_node_attr = node_attr.new_zeros((num_nodes, n_radial, self.n_angular_sym, n_channel))
+        sym_node_attr[:, :, 0, :] = node_attr[:, :, 0, :]
+
+        for nu in range(2, self.max_nu + 1):
+            indices = getattr(self, f"indices_nu{nu}", None)
+            prefactors = getattr(self, f"prefactors_nu{nu}", None)
+            slots = getattr(self, f"slots_nu{nu}", None)
+            n_slots = self.n_slots_per_order.get(nu)
+            if indices is None or prefactors is None or slots is None or n_slots is None:
+                continue
+
+            # indices = indices.to(node_attr.device)
+            # prefactors = prefactors.to(node_attr.device, dtype=node_attr.dtype)
+            # slots = slots.to(node_attr.device)
+
+            gathered = node_attr[:, :, indices, :]
+            products = torch.prod(gathered, dim=3)
+            weighted = products * prefactors.view(1, 1, -1, 1)
+
+            slice_out = node_attr.new_zeros((num_nodes, n_radial, n_slots, n_channel))
+            scatter_idx = slots.view(1, 1, -1, 1).expand(num_nodes, n_radial, -1, n_channel)
+            slice_out.scatter_add_(2, scatter_idx, weighted)
+
+            offset = self.order_offsets[nu]
+            sym_node_attr[:, :, offset:offset + n_slots, :] = slice_out
+
+        return sym_node_attr
+
 class Symmetrizer_Tensor(nn.Module):
     """ This symmetrizer is implemented using tensor operations. 
         Not performant for nu=4, but should be fine for smaller nu and large max_l.
@@ -294,13 +391,14 @@ class Symmetrizer_Tensor_Optimized(Symmetrizer_Tensor):
         sym_node_attr[:, :, 0, :] = node_attr[:, :, 0, :]
         n_sym_node_attr = 1
 
+        # with shared_intermediates():
         if self.max_nu >= 2:
             # Fuse the two einsum operations to avoid storing node_attr_2
             sym_tensor = self.sym_tensor_allnu[2]
             n_sym_node_attr_now = sym_tensor.shape[2]
 
-            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = contract(
-                'ijlk,ijmk,lma->ijak', node_attr, node_attr, sym_tensor, optimize='optimal', backend='torch'
+            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = torch.einsum(
+                'ijlk,ijmk,lma->ijak', node_attr, node_attr, sym_tensor
             )
             n_sym_node_attr += n_sym_node_attr_now
 
@@ -309,8 +407,8 @@ class Symmetrizer_Tensor_Optimized(Symmetrizer_Tensor):
             sym_tensor = self.sym_tensor_allnu[3]
             n_sym_node_attr_now = sym_tensor.shape[3]
 
-            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = contract(
-                'ijlk,ijmk,ijnk,lmna->ijak', node_attr, node_attr, node_attr, sym_tensor, optimize='optimal', backend='torch'
+            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = torch.einsum(
+                'ijlk,ijmk,ijnk,lmna->ijak', node_attr, node_attr, node_attr, sym_tensor
             )
             n_sym_node_attr += n_sym_node_attr_now
 
@@ -319,10 +417,9 @@ class Symmetrizer_Tensor_Optimized(Symmetrizer_Tensor):
             sym_tensor = self.sym_tensor_allnu[4]
             n_sym_node_attr_now = sym_tensor.shape[4]
 
-            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = contract(
-                'ijlk,ijmk,ijnk,ijok,lmnoa->ijak', node_attr, node_attr, node_attr, node_attr, sym_tensor, optimize='optimal', backend='torch'
+            sym_node_attr[:, :, n_sym_node_attr:n_sym_node_attr+n_sym_node_attr_now: , :] = torch.einsum(
+                'ijlk,ijmk,ijnk,ijok,lmnoa->ijak', node_attr, node_attr, node_attr, node_attr, sym_tensor
             )
             n_sym_node_attr += n_sym_node_attr_now
 
         return sym_node_attr
-
