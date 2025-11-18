@@ -2,14 +2,17 @@ import torch
 import torch.nn as nn
 import numpy as np
 from opt_einsum import contract, shared_intermediates
+import warnings
+import math
 from .angular_tools import (
     find_combo_vectors_nu2,
     find_combo_vectors_nu3,
     find_combo_vectors_nu4
     )
+from .kernels.symmetrizer import HAS_TRITON, run_symmetrizer_order_kernel
 
 __all__ = ['Symmetrizer', 'Symmetrizer_Vectorized', 'Symmetrizer_JIT',
-           'Symmetrizer_Tensor', 'Symmetrizer_Tensor_Optimized']
+           'Symmetrizer_Tensor', 'Symmetrizer_Tensor_Optimized', 'Symmetrizer_Triton']
 
 """
 This class is used to symmetrize the basis functions in the A basis.
@@ -223,10 +226,17 @@ class Symmetrizer_Vectorized(nn.Module):
             indices_tensor = torch.tensor(combo_indices, dtype=torch.long)
             prefactors_tensor = torch.tensor(combo_prefactors, dtype=torch.get_default_dtype())
             slots_tensor = torch.tensor(combo_slots, dtype=torch.long)
+            counts = torch.bincount(
+                slots_tensor,
+                minlength=len(vec_dict),
+            )
+            slot_offsets = torch.zeros(len(vec_dict) + 1, dtype=torch.long)
+            slot_offsets[1:] = torch.cumsum(counts, dim=0)
 
             self.register_buffer(f"indices_nu{nu}", indices_tensor)
             self.register_buffer(f"prefactors_nu{nu}", prefactors_tensor)
             self.register_buffer(f"slots_nu{nu}", slots_tensor)
+            self.register_buffer(f"slot_offsets_nu{nu}", slot_offsets)
             self.order_offsets[nu] = offset
             self.n_slots_per_order[nu] = len(vec_dict)
             offset += len(vec_dict)
@@ -422,4 +432,111 @@ class Symmetrizer_Tensor_Optimized(Symmetrizer_Tensor):
             )
             n_sym_node_attr += n_sym_node_attr_now
 
+        return sym_node_attr
+
+
+class Symmetrizer_Triton(Symmetrizer_Vectorized):
+    """Symmetrizer implementation that accelerates the vectorized formulation with Triton."""
+
+    def __init__(
+        self,
+        max_nu: int,
+        max_l: int,
+        l_list: list,
+        block_rows: int = 128,
+        block_combos: int = 32,
+    ):
+        super().__init__(max_nu=max_nu, max_l=max_l, l_list=l_list)
+        self.block_rows = block_rows
+        self.block_combos = block_combos
+        self.use_triton = HAS_TRITON
+        if not HAS_TRITON:
+            warnings.warn(
+                "Triton is not available; Symmetrizer_Triton will fall back to the "
+                "vectorized implementation.",
+                RuntimeWarning,
+            )
+
+        self.slot_iters_per_order = {}
+
+        # Convert index/slot buffers to int32 to avoid casting on every launch
+        for nu in range(2, self.max_nu + 1):
+            idx_name = f"indices_nu{nu}"
+            slot_name = f"slots_nu{nu}"
+            offset_name = f"slot_offsets_nu{nu}"
+            if hasattr(self, idx_name):
+                tensor = getattr(self, idx_name)
+                if tensor is not None:
+                    delattr(self, idx_name)
+                    self.register_buffer(idx_name, tensor.to(torch.int32))
+            if hasattr(self, slot_name):
+                tensor = getattr(self, slot_name)
+                if tensor is not None:
+                    delattr(self, slot_name)
+                    self.register_buffer(slot_name, tensor.to(torch.int32))
+            if hasattr(self, offset_name):
+                tensor = getattr(self, offset_name)
+                if tensor is not None:
+                    delattr(self, offset_name)
+                    self.register_buffer(offset_name, tensor.to(torch.int32))
+                    counts = tensor[1:] - tensor[:-1]
+                    max_count = counts.max().item() if counts.numel() > 0 else 0
+                    self.slot_iters_per_order[nu] = max(
+                        1, math.ceil(max_count / self.block_combos)
+                    )
+                else:
+                    self.slot_iters_per_order[nu] = 1
+
+    def forward(self, node_attr: torch.Tensor):
+        if (
+            not self.use_triton
+            or node_attr.device.type != "cuda"
+            or node_attr.numel() == 0
+        ):
+            return super().forward(node_attr)
+        return self._forward_triton(node_attr)
+
+    def _forward_triton(self, node_attr: torch.Tensor) -> torch.Tensor:
+        num_nodes, n_radial, n_l, n_channel = node_attr.size()
+        node_attr = node_attr.contiguous()
+        node_flat = node_attr.permute(0, 1, 3, 2).reshape(-1, n_l).contiguous()
+        out_flat = torch.zeros(
+            (node_flat.shape[0], self.n_angular_sym),
+            dtype=node_attr.dtype,
+            device=node_attr.device,
+        )
+        out_flat[:, 0] = node_attr[:, :, 0, :].reshape(-1)
+
+        for nu in range(2, self.max_nu + 1):
+            indices = getattr(self, f"indices_nu{nu}", None)
+            prefactors = getattr(self, f"prefactors_nu{nu}", None)
+            slot_offsets = getattr(self, f"slot_offsets_nu{nu}", None)
+            if (
+                indices is None
+                or prefactors is None
+                or self.n_slots_per_order.get(nu) is None
+                or slot_offsets is None
+            ):
+                continue
+
+            pref = prefactors
+            if pref.dtype != node_attr.dtype:
+                pref = pref.to(node_attr.dtype)
+            run_symmetrizer_order_kernel(
+                node_flat,
+                out_flat,
+                indices,
+                pref,
+                slot_offsets,
+                self.order_offsets[nu],
+                block_rows=self.block_rows,
+                block_combos=self.block_combos,
+                max_iters=self.slot_iters_per_order.get(nu, 1),
+            )
+
+        sym_node_attr = (
+            out_flat.view(num_nodes, n_radial, n_channel, self.n_angular_sym)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+        )
         return sym_node_attr

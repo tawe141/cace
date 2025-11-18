@@ -46,7 +46,7 @@ class SharedRadialLinearTransform(nn.Module):
         for index, weight in enumerate(self.weights):
             i_start = self.angular_dim_groups[index, 0]
             i_end = self.angular_dim_groups[index, 1]
-            group = torch.arange(i_start, i_end)
+            group = torch.arange(i_start, i_end, device=x.device)
             # Gather all angular dimensions for the current group
             group_x = x[:, :, group, :]  # Shape: [n_nodes, radial_dim, len(group), embedding_dim]
             # Apply the transformation for the entire group at once
