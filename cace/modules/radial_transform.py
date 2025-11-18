@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 class SharedRadialLinearTransform(nn.Module):
     # TODO: this can be jitted, however, this causes trouble in saving the model
@@ -69,3 +69,39 @@ class SharedRadialLinearTransform(nn.Module):
             angular_dim_groups.append(l_list_atl)
             l_now += self._compute_length_lxlylz(l)
         return angular_dim_groups
+
+
+class SharedRadialLinearTransformV2(SharedRadialLinearTransform):
+    """Shared radial transform that caches angular dimension slices."""
+
+    def __init__(self, max_l: int, radial_dim: int, radial_embedding_dim: Optional[int] = None, channel_dim: Optional[int] = None):
+        super().__init__(max_l, radial_dim, radial_embedding_dim, channel_dim)
+        self._group_slices: Tuple[slice, ...] = self._cache_group_slices()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n_nodes, radial_dim, angular_dim, embedding_dim = x.shape
+        output = torch.zeros(
+            n_nodes,
+            self.radial_embedding_dim,
+            angular_dim,
+            embedding_dim,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        for weight, group_slice in zip(self.weights, self._group_slices):
+            group_x = x[:, :, group_slice, :]
+            if self.channel_dim:
+                transformed_group = torch.einsum("ijkh,jmh->imkh", group_x, weight)
+            else:
+                transformed_group = torch.einsum("ijkh,jm->imkh", group_x, weight)
+            output[:, :, group_slice, :] = transformed_group
+        return output
+
+    def _cache_group_slices(self) -> Tuple[slice, ...]:
+        slices = []
+        for start, end in self.angular_dim_groups:
+            start_int = int(start.item() if isinstance(start, torch.Tensor) else start)
+            end_int = int(end.item() if isinstance(end, torch.Tensor) else end)
+            slices.append(slice(start_int, end_int))
+        return tuple(slices)
